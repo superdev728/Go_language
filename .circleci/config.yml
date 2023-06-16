@@ -1,0 +1,96 @@
+version: 2
+install_node_tooling: &install_node_tooling
+  - run:
+      name: Install node tooling
+      command: |
+        sudo apt install apt-transport-https &&
+        curl -sS https://dl.yarnpkg.com/debian/pubkey.gpg | sudo apt-key add - &&
+        echo "deb https://dl.yarnpkg.com/debian/ stable main" | sudo tee /etc/apt/sources.list.d/yarn.list &&
+        sudo apt update &&
+        sudo apt install yarn &&
+        curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.35.3/install.sh | bash
+install_postgres: &install_postgres
+  - run:
+      name: Install Postgres (for automated tests)
+      # Note: For reasons unknown, just invoking psql as the `postgres` user with sudo resulted in a request for
+      #       the `circleci` user password, which shouldn't happen in CircleCI. Hence use of su.
+      # See https://www.postgresql.org/download/linux/debian/
+      command: |
+        sudo apt update
+        sudo apt install lsb-release
+        sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+        wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+        sudo apt update
+        sudo apt install postgresql-12
+        sudo pg_ctlcluster 12 main start
+        sudo su - postgres -c 'psql -c "CREATE USER circleci; ALTER USER circleci Superuser;"'
+        sudo mv .circleci/pg_hba.conf /etc/postgresql/12/main/pg_hba.conf
+        sudo pg_ctlcluster 12 main restart
+build_frontend: &build_frontend
+  - run:
+      name: Build frontend bundle
+      command: |
+        source ~/.nvm/nvm.sh &&
+        cd ${FRONTEND_ROOT} &&
+        nvm install && nvm use &&
+        yarn install &&
+        sh build_bundle.sh
+run_e2e_tests: &run_e2e_tests
+  - run:
+      name: End-to-end tests
+      command: |
+        source ~/.nvm/nvm.sh &&
+        cd e2e_tests &&
+        nvm install && nvm use &&
+        yarn install &&
+        yarn test
+jobs:
+  build_and_deploy:
+    docker:
+      - image: cimg/python:3.9-browsers
+    steps:
+      - checkout
+      - run: sh .circleci/set_env_vars.sh
+      # install gcloud
+      - run: curl -o $HOME/google-cloud-cli-412.0.0-linux-x86_64.tar.gz https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-412.0.0-linux-x86_64.tar.gz
+      - run: tar zxf $HOME/google-cloud-cli-412.0.0-linux-x86_64.tar.gz -C $HOME
+      - run: CLOUDSDK_CORE_DISABLE_PROMPTS=1 $HOME/google-cloud-sdk/install.sh
+      - run: echo 'source ${HOME}/google-cloud-sdk/path.bash.inc' >> $BASH_ENV
+      - run: gcloud components update
+      - <<: *install_postgres
+      # install deps locally to enable unit testing
+      - run:
+          name: Create Python virtual env for use with all commands
+          command: |
+            python3 -m venv venv
+            echo "source $(pwd)/venv/bin/activate" >> $BASH_ENV
+      - run: curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py
+      - run: python3 get-pip.py
+      - run: pip install -r ${SERVER_CODE_ROOT}/src/requirements.txt
+      - run: pip install -r ${SERVER_CODE_ROOT}/dev_requirements.txt
+      # Retrieve our secrets from the CircleCI environment
+      - run: echo $APP_YML_BASE64 | base64 --decode > ${SERVER_SRC_ROOT}/config/app.yml
+      - run: echo $CLIENT_SECRETS_BASE64 | base64 --decode > ${SERVER_SRC_ROOT}/config/client_secrets.json
+      # Deployment service account needs these roles:
+      # - App Engine Deployer (to deploy new versions)
+      # - App Engine Service Admin (to change versions)
+      # - Cloud Datastore Index Admin (to update indexes)
+      # - Storage Object Creator (to upload app files)
+      # - Storage Object Viewer (to list app files)
+      - run: echo $DEPLOYER_CLIENT_SECRETS | base64 --decode > ${HOME}/deployer_client_secrets.json
+      - run: cd ${SERVER_CODE_ROOT} && bash run_tests/run.sh
+      - <<: *install_node_tooling
+      - run: gcloud auth activate-service-account --key-file ${HOME}/deployer_client_secrets.json
+      - run: gcloud config set project $GCLOUD_PROJECT
+      - run: gcloud app deploy --no-promote --project $GCLOUD_PROJECT -q -v $NEW_TROTTO_VERSION_ID ${SERVER_SRC_ROOT}/app.yaml ${SERVER_SRC_ROOT}/index.yaml
+      - <<: *run_e2e_tests
+      - run: gcloud app deploy --promote --project $GCLOUD_PROJECT -q -v $NEW_TROTTO_VERSION_ID ${SERVER_SRC_ROOT}/app.yaml ${SERVER_SRC_ROOT}/index.yaml
+# TODO: Split into build/test and deploy jobs (latter is the only job that needs gcloud/deployment creds).
+workflows:
+  version: 2
+  build_and_deploy:
+    jobs:
+      - build_and_deploy:
+          filters:
+            branches:
+              only: master
